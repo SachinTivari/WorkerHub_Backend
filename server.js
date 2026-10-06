@@ -16,7 +16,7 @@ app.use(cors({
 app.use(express.json())
 
 // MongoDB Connection
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/worker_portfolio'
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/WorkerHub'
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Connected to MongoDB'))
@@ -256,7 +256,11 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   phone: String,
-  photo_url: String
+  photo_url: String,
+  location: {
+    address: String
+  },
+  role: { type: String, enum: ['user', 'admin'], default: 'user' }
 }, { timestamps: true })
 
 const User = mongoose.model('User', userSchema)
@@ -277,16 +281,18 @@ const workerSchema = new mongoose.Schema({
   email: String,
   password: { type: String, required: true },
   category: { type: String, required: true },
-  hourly_rate: { type: Number, default: 0 },
+  daily_rate: { type: Number, default: 0 },
   location: String,
   bio: String,
   skills: String,
   photo_url: String,
   availability: { type: String, enum: ['available', 'busy', 'offline'], default: 'available' },
   rating: { type: Number, default: 0 },
+  total_reviews: { type: Number, default: 0 },
   total_jobs: { type: Number, default: 0 },
   aadhaar_number: String,
-  aadhaar_verified: { type: Boolean, default: false }
+  aadhaar_verified: { type: Boolean, default: false },
+  account_status: { type: String, enum: ['pending', 'approved', 'rejected', 'blocked'], default: 'pending' }
 }, { timestamps: true })
 
 const Worker = mongoose.model('Worker', workerSchema)
@@ -301,10 +307,51 @@ const bookingSchema = new mongoose.Schema({
   booking_time: String,
   address: String,
   notes: String,
-  status: { type: String, enum: ['pending', 'confirmed', 'completed', 'cancelled'], default: 'pending' }
+  status: { type: String, enum: ['pending', 'confirmed', 'completed', 'cancelled'], default: 'pending' },
+  payment_status: { type: String, enum: ['pending', 'paid'], default: 'pending' },
+  payment_method: { type: String, enum: ['upi', 'card', 'net_banking', 'cash', 'none'], default: 'none' },
+  service_amount: { type: Number, default: 299 },
+  platform_fee: { type: Number, default: 20 },
+  total_amount: { type: Number, default: 319 },
+  is_reviewed: { type: Boolean, default: false }
 }, { timestamps: true })
 
 const Booking = mongoose.model('Booking', bookingSchema)
+
+const complaintSchema = new mongoose.Schema({
+  booking_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', required: true },
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  worker_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Worker' },
+  issue: { 
+    type: String, 
+    required: true,
+    enum: ['Worker didn\'t arrive', 'Wrong service', 'Payment issue', 'Worker behaviour', 'Other']
+  },
+  description: { type: String, required: true },
+  status: { type: String, enum: ['open', 'in_progress', 'resolved'], default: 'open' }
+}, { timestamps: true })
+
+const Complaint = mongoose.model('Complaint', complaintSchema)
+
+const notificationSchema = new mongoose.Schema({
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  worker_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Worker' },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  read: { type: Boolean, default: false }
+}, { timestamps: true })
+
+const Notification = mongoose.model('Notification', notificationSchema)
+
+const reviewSchema = new mongoose.Schema({
+  booking_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', required: true },
+  worker_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Worker', required: true },
+  user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  rating: { type: Number, required: true, min: 1, max: 5 },
+  review_text: { type: String }
+}, { timestamps: true })
+
+const Review = mongoose.model('Review', reviewSchema)
 
 // ============ SEED DEFAULT CATEGORIES ============
 
@@ -363,7 +410,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
     res.status(201).json({
       message: 'User created successfully',
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone }
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, role: user.role }
     })
   } catch (error) {
     console.error('Signup error:', error)
@@ -387,11 +434,84 @@ app.post('/api/auth/login', async (req, res) => {
 
     res.json({
       message: 'Login successful',
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, photo_url: user.photo_url }
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, photo_url: user.photo_url, role: user.role }
     })
   } catch (error) {
     console.error('Login error:', error)
     res.status(500).json({ error: 'Server error' })
+  }
+})
+
+// Google Auth Callback
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { name, email, photo_url } = req.body
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required for Google login' })
+    }
+
+    // Check if user exists
+    let user = await User.findOne({ email })
+    
+    if (!user) {
+      // Create new user for Google login
+      // Generate a random password since they use Google to login
+      const randomPassword = Math.random().toString(36).slice(-10)
+      const hashedPassword = await bcrypt.hash(randomPassword, 10)
+
+      user = new User({
+        name: name || 'Google User',
+        email,
+        password: hashedPassword,
+        photo_url: photo_url || ''
+      })
+      await user.save()
+      
+      // Optionally send welcome email
+      sendEmail(email, emailTemplates.userSignup(user.name, user.email))
+      console.log('✅ New user created via Google Auth:', user.email)
+    } else {
+      console.log('✅ Existing user logged in via Google Auth:', user.email)
+      
+      // Update photo if they didn't have one
+      if (!user.photo_url && photo_url) {
+        user.photo_url = photo_url
+        await user.save()
+      }
+    }
+
+    res.json({
+      message: 'Google login successful',
+      user: { id: user._id, name: user.name, email: user.email, phone: user.phone, photo_url: user.photo_url, role: user.role }
+    })
+  } catch (error) {
+    console.error('Google Auth error:', error)
+    res.status(500).json({ error: 'Server error during Google Authentication' })
+  }
+})
+
+// Setup first admin user
+app.post('/api/admin/setup-first-admin', async (req, res) => {
+  try {
+    const existingAdmin = await User.findOne({ role: 'admin' })
+    if (existingAdmin) {
+      return res.status(400).json({ error: 'An admin already exists. Cannot use setup route.' })
+    }
+
+    const hashedPassword = await bcrypt.hash('admin123', 10)
+    const adminUser = new User({
+      name: 'Super Admin',
+      email: 'admin@workerhub.com',
+      password: hashedPassword,
+      phone: '0000000000',
+      role: 'admin'
+    })
+    
+    await adminUser.save()
+    res.json({ message: 'First admin created! Email: admin@workerhub.com, Password: admin123' })
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create admin' })
   }
 })
 
@@ -473,6 +593,49 @@ app.post('/api/auth/forgot-password/reset', async (req, res) => {
   }
 })
 
+// Users Routes
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await User.find().select('-password').sort({ createdAt: -1 })
+    res.json(users)
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch users' })
+  }
+})
+
+// Update User Profile
+app.patch('/api/users/:id', async (req, res) => {
+  try {
+    const { name, phone, location } = req.body
+
+    const user = await User.findById(req.params.id)
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' })
+    }
+
+    if (name !== undefined) user.name = name
+    if (phone !== undefined) user.phone = phone
+    if (location !== undefined) user.location = location
+
+    await user.save()
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        location: user.location,
+        photo_url: user.photo_url,
+        role: user.role
+      }
+    })
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update user' })
+  }
+})
+
 // Categories Routes
 app.get('/api/categories', async (req, res) => {
   try {
@@ -486,34 +649,16 @@ app.get('/api/categories', async (req, res) => {
 // Workers Routes
 app.get('/api/workers', async (req, res) => {
   try {
-    const { category, availability, location } = req.query
+    const { category, availability } = req.query
     const filter = {}
 
     if (category) filter.category = category
     if (availability) filter.availability = availability
-    if (location) {
-      // Case-insensitive partial match for location
-      filter.location = { $regex: location, $options: 'i' }
-    }
 
     const workers = await Worker.find(filter).sort({ createdAt: -1 })
     res.json(workers)
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch workers' })
-  }
-})
-
-// Get all unique locations for filter dropdown
-app.get('/api/locations', async (req, res) => {
-  try {
-    const locations = await Worker.distinct('location')
-    // Filter out empty/null values and sort alphabetically
-    const validLocations = locations
-      .filter(loc => loc && loc.trim() !== '')
-      .sort((a, b) => a.localeCompare(b))
-    res.json(validLocations)
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch locations' })
   }
 })
 
@@ -529,12 +674,37 @@ app.get('/api/workers/:id', async (req, res) => {
   }
 })
 
+// Update worker status (Admin only)
+app.patch('/api/admin/workers/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body
+    
+    // Validate status
+    if (!['pending', 'approved', 'rejected', 'blocked'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' })
+    }
+
+    const worker = await Worker.findById(req.params.id)
+    if (!worker) {
+      return res.status(404).json({ error: 'Worker not found' })
+    }
+
+    worker.account_status = status
+    await worker.save()
+
+    res.json({ message: `Worker status updated to ${status}`, worker })
+  } catch (error) {
+    console.error('Failed to update worker status:', error)
+    res.status(500).json({ error: 'Failed to update worker status' })
+  }
+})
+
 // Worker Registration (Signup)
 app.post('/api/workers', async (req, res) => {
   console.log('📝 Received worker registration:', req.body)
 
   try {
-    const { name, phone, email, password, category, hourly_rate, location, bio, skills, aadhaar_number, availability } = req.body
+    const { name, phone, email, password, category, daily_rate, location, bio, skills, aadhaar_number, availability } = req.body
 
     // Validate required fields
     if (!name || !phone || !category || !password) {
@@ -562,7 +732,7 @@ app.post('/api/workers', async (req, res) => {
       email,
       password: hashedPassword,
       category,
-      hourly_rate: hourly_rate || 0,
+      daily_rate: daily_rate || 0,
       location,
       bio,
       skills,
@@ -588,7 +758,7 @@ app.post('/api/workers', async (req, res) => {
         phone: worker.phone,
         email: worker.email,
         category: worker.category,
-        hourly_rate: worker.hourly_rate,
+        daily_rate: worker.daily_rate,
         location: worker.location,
         availability: worker.availability
       }
@@ -640,7 +810,7 @@ app.post('/api/workers/login', async (req, res) => {
         phone: worker.phone,
         email: worker.email,
         category: worker.category,
-        hourly_rate: worker.hourly_rate,
+        daily_rate: worker.daily_rate,
         location: worker.location,
         bio: worker.bio,
         skills: worker.skills,
@@ -750,7 +920,7 @@ app.post('/api/workers/forgot-password/reset', async (req, res) => {
 // Update Worker Profile
 app.patch('/api/workers/:id', async (req, res) => {
   try {
-    const { availability, hourly_rate, location, bio, skills, photo_url } = req.body
+    const { availability, daily_rate, location, bio, skills, photo_url } = req.body
 
     const worker = await Worker.findById(req.params.id)
     if (!worker) {
@@ -759,7 +929,7 @@ app.patch('/api/workers/:id', async (req, res) => {
 
     // Update fields if provided
     if (availability !== undefined) worker.availability = availability
-    if (hourly_rate !== undefined) worker.hourly_rate = hourly_rate
+    if (daily_rate !== undefined) worker.daily_rate = daily_rate
     if (location !== undefined) worker.location = location
     if (bio !== undefined) worker.bio = bio
     if (skills !== undefined) worker.skills = skills
@@ -776,7 +946,7 @@ app.patch('/api/workers/:id', async (req, res) => {
         phone: worker.phone,
         email: worker.email,
         category: worker.category,
-        hourly_rate: worker.hourly_rate,
+        daily_rate: worker.daily_rate,
         location: worker.location,
         bio: worker.bio,
         skills: worker.skills,
@@ -815,7 +985,7 @@ app.get('/api/bookings', async (req, res) => {
     if (user_id) filter.user_id = user_id
 
     const bookings = await Booking.find(filter)
-      .populate('worker_id', 'name category phone')
+      .populate('worker_id', 'name category phone daily_rate')
       .sort({ createdAt: -1 })
 
     // Format response to match previous API structure
@@ -836,6 +1006,14 @@ app.post('/api/bookings', async (req, res) => {
   try {
     const { worker_id, user_id, customer_name, customer_phone, booking_date, booking_time, address, notes } = req.body
 
+    // Fetch worker to get their hourly rate
+    const worker = await Worker.findById(worker_id)
+    if (!worker) return res.status(404).json({ error: 'Worker not found' })
+
+    const service_amount = worker.daily_rate || 299 // Default to 299 if not set
+    const platform_fee = 20
+    const total_amount = service_amount + platform_fee
+
     const booking = new Booking({
       worker_id,
       user_id,
@@ -844,13 +1022,23 @@ app.post('/api/bookings', async (req, res) => {
       booking_date,
       booking_time,
       address,
-      notes
+      notes,
+      service_amount,
+      platform_fee,
+      total_amount
     })
 
     await booking.save()
 
+    // Create Notification for Worker
+    await new Notification({
+      worker_id,
+      title: 'New booking request',
+      message: `You have a new booking from ${customer_name} on ${booking_date.split('T')[0]}.`
+    }).save()
+
     // Set worker availability to "busy" when booked
-    const worker = await Worker.findByIdAndUpdate(worker_id, { availability: 'busy' }, { new: true })
+    await Worker.findByIdAndUpdate(worker_id, { availability: 'busy' })
 
     // Send email notifications
     const formattedDate = new Date(booking_date).toLocaleDateString('en-IN', { 
@@ -904,6 +1092,30 @@ app.patch('/api/bookings/:id', async (req, res) => {
     booking.status = status
     await booking.save()
 
+    // Create Notification for User
+    if (booking.user_id) {
+      let title = ''
+      let message = ''
+      if (status === 'confirmed') {
+        title = 'Worker accepted your booking'
+        message = `${booking.worker_id.name} is on the way!`
+      } else if (status === 'completed') {
+        title = 'Service completed'
+        message = `Your service by ${booking.worker_id.name} has been completed.`
+      } else if (status === 'cancelled') {
+        title = 'Booking cancelled'
+        message = `Your booking for ${booking.worker_id.name} was cancelled.`
+      }
+      
+      if (title) {
+        await new Notification({
+          user_id: booking.user_id,
+          title,
+          message
+        }).save()
+      }
+    }
+
     // If booking is completed or cancelled, set worker back to available
     if (status === 'completed' || status === 'cancelled') {
       await Worker.findByIdAndUpdate(booking.worker_id._id, { availability: 'available' })
@@ -944,11 +1156,34 @@ app.get('/api/workers/stats/:category', async (req, res) => {
 
     res.json({ total, available, busy, offline })
   } catch (error) {
+    res.status(500).json({ error: 'Failed to add review' })
+  }
+})
+
+// Admin Routes
+app.get('/api/admin/stats', async (req, res) => {
+  try {
+    const totalUsers = await User.countDocuments()
+    const totalWorkers = await Worker.countDocuments()
+    const totalBookings = await Booking.countDocuments()
+    const pendingWorkers = await Worker.countDocuments({ aadhaar_verified: false })
+    const activeBookings = await Booking.countDocuments({ status: 'confirmed' })
+    
+    res.json({
+      totalUsers,
+      totalWorkers,
+      totalBookings,
+      revenue: '₹8.5L',
+      pendingWorkers,
+      activeBookings,
+      complaints: 8
+    })
+  } catch (error) {
     res.status(500).json({ error: 'Failed to fetch stats' })
   }
 })
 
-// ============ EMAIL CONFIGURATION ENDPOINTS ============
+// ============ INITIALIZATION ======================
 
 // Check email configuration status
 app.get('/api/email/status', (req, res) => {
@@ -1022,6 +1257,210 @@ app.post('/api/email/test', async (req, res) => {
   }
 })
 
+// ============ COMPLAINTS ROUTES ============
+
+// Create a new complaint
+app.post('/api/complaints', async (req, res) => {
+  try {
+    const { booking_id, user_id, worker_id, issue, description } = req.body
+    
+    const complaint = new Complaint({
+      booking_id,
+      user_id,
+      worker_id,
+      issue,
+      description
+    })
+    
+    await complaint.save()
+    res.status(201).json(complaint)
+  } catch (error) {
+    console.error('Error creating complaint:', error)
+    res.status(500).json({ error: 'Failed to submit complaint' })
+  }
+})
+
+// Get all complaints (Admin)
+app.get('/api/complaints', async (req, res) => {
+  try {
+    const complaints = await Complaint.find()
+      .populate('user_id', 'name email phone')
+      .populate('worker_id', 'name category phone')
+      .populate('booking_id')
+      .sort({ createdAt: -1 })
+      
+    res.json(complaints)
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch complaints' })
+  }
+})
+
+// Update complaint status (Admin)
+app.put('/api/complaints/:id/status', async (req, res) => {
+  try {
+    const { status } = req.body
+    const complaint = await Complaint.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }
+    )
+    
+    if (!complaint) {
+      return res.status(404).json({ error: 'Complaint not found' })
+    }
+    
+    res.json(complaint)
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update complaint' })
+  }
+})
+
+// ============ NOTIFICATION ROUTES ============
+
+// Get notifications for a user or worker
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const { user_id, worker_id } = req.query
+    const filter = {}
+    
+    if (user_id) filter.user_id = user_id
+    else if (worker_id) filter.worker_id = worker_id
+    else return res.status(400).json({ error: 'Must provide user_id or worker_id' })
+    
+    const notifications = await Notification.find(filter).sort({ createdAt: -1 }).limit(50)
+    res.json(notifications)
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch notifications' })
+  }
+})
+
+// Mark notifications as read
+app.put('/api/notifications/mark-read', async (req, res) => {
+  try {
+    const { user_id, worker_id } = req.body
+    const filter = {}
+    
+    if (user_id) filter.user_id = user_id
+    else if (worker_id) filter.worker_id = worker_id
+    else return res.status(400).json({ error: 'Must provide user_id or worker_id' })
+    
+    await Notification.updateMany(
+      { ...filter, read: false },
+      { $set: { read: true } }
+    )
+    
+    res.json({ message: 'Notifications marked as read' })
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update notifications' })
+  }
+})
+
+// ============ REVIEWS & PAYMENTS ============
+
+// Simulate Payment for Booking
+app.post('/api/bookings/:id/pay', async (req, res) => {
+  try {
+    const { payment_method } = req.body
+    
+    const booking = await Booking.findById(req.params.id)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+    
+    if (booking.status !== 'completed') {
+      return res.status(400).json({ error: 'Can only pay for completed services' })
+    }
+    
+    booking.payment_status = 'paid'
+    booking.payment_method = payment_method || 'cash'
+    await booking.save()
+    
+    res.json({ message: 'Payment successful', booking })
+  } catch (error) {
+    res.status(500).json({ error: 'Payment processing failed' })
+  }
+})
+
+// Submit Review
+app.post('/api/reviews', async (req, res) => {
+  try {
+    const { booking_id, worker_id, user_id, rating, review_text } = req.body
+    
+    const booking = await Booking.findById(booking_id)
+    if (!booking) return res.status(404).json({ error: 'Booking not found' })
+    if (booking.is_reviewed) return res.status(400).json({ error: 'Review already submitted' })
+    
+    const review = new Review({ booking_id, worker_id, user_id, rating, review_text })
+    await review.save()
+    
+    booking.is_reviewed = true
+    await booking.save()
+    
+    // Update worker rating dynamically
+    const allReviews = await Review.find({ worker_id })
+    const total_reviews = allReviews.length
+    const average_rating = total_reviews > 0 
+      ? allReviews.reduce((sum, r) => sum + r.rating, 0) / total_reviews 
+      : rating
+      
+    await Worker.findByIdAndUpdate(worker_id, {
+      rating: parseFloat(average_rating.toFixed(1)),
+      total_reviews
+    })
+    
+    res.json({ message: 'Review submitted successfully', review })
+  } catch (error) {
+    console.error('Review Error:', error)
+    res.status(500).json({ error: 'Failed to submit review' })
+  }
+})
+
+// Get Worker Reviews
+app.get('/api/workers/:id/reviews', async (req, res) => {
+  try {
+    const reviews = await Review.find({ worker_id: req.params.id })
+      .populate('user_id', 'name photo_url')
+      .sort({ createdAt: -1 })
+    res.json(reviews)
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch reviews' })
+  }
+})
+
+// Admin Payments Dashboard Route
+app.get('/api/admin/payments', async (req, res) => {
+  try {
+    const completedBookings = await Booking.find({ status: 'completed' })
+      .populate('worker_id', 'name')
+      .populate('user_id', 'name')
+      .sort({ createdAt: -1 })
+
+    let totalRevenue = 0
+    let platformRevenue = 0
+    let pendingAmount = 0
+
+    completedBookings.forEach(booking => {
+      if (booking.payment_status === 'paid') {
+        totalRevenue += booking.total_amount
+        platformRevenue += booking.platform_fee
+      } else {
+        pendingAmount += booking.total_amount
+      }
+    })
+
+    res.json({
+      stats: {
+        totalRevenue,
+        platformRevenue,
+        pendingAmount,
+        totalCompletedBookings: completedBookings.length
+      },
+      bookings: completedBookings
+    })
+  } catch (error) {
+    console.error('Error fetching admin payments:', error)
+    res.status(500).json({ error: 'Failed to fetch payment data' })
+  }
+})
+
 // Start server
 const startServer = async () => {
   try {
@@ -1057,18 +1496,4 @@ const startServer = async () => {
   }
 }
 
-// For local development
-if (process.env.NODE_ENV !== 'production') {
-  startServer()
-} else {
-  // For Vercel - connect to MongoDB on cold start
-  mongoose.connect(MONGO_URI)
-    .then(() => {
-      console.log('✅ Connected to MongoDB')
-      seedCategories()
-    })
-    .catch(err => console.error('❌ MongoDB Connection Error:', err.message))
-}
-
-// Export for Vercel
-module.exports = app
+startServer()
